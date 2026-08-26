@@ -14,11 +14,24 @@ fn help_exposes_the_browser_and_share_workflows() {
             .and(predicate::str::contains("SOURCE|DIR")),
     );
 
+    glow().args(["serve", "--help"]).assert().success().stdout(
+        predicate::str::contains("-P, --port")
+            .and(predicate::str::contains("--lan"))
+            .and(predicate::str::contains("--host <IP>")),
+    );
+}
+
+#[test]
+fn lan_mode_cannot_be_combined_with_an_explicit_host() {
     glow()
-        .args(["serve", "--help"])
+        .args(["serve", "--lan", "--host", "127.0.0.1"])
         .assert()
-        .success()
-        .stdout(predicate::str::contains("-P, --port"));
+        .failure()
+        .stderr(
+            predicate::str::contains("--lan")
+                .and(predicate::str::contains("--host"))
+                .and(predicate::str::contains("cannot be used with")),
+        );
 }
 
 #[test]

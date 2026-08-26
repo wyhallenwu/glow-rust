@@ -170,6 +170,9 @@ glow list ./docs --json
 # 本地 Web 文档站
 glow serve ./docs --open
 
+# 让同一局域网内的其他设备访问
+glow serve ./docs --lan --port 8080
+
 # 临时公网分享
 glow share ./docs --open
 ```
@@ -319,13 +322,57 @@ glow serve ./docs --open
 # 固定本机端口
 glow serve ./docs --port 8080
 
-# 允许局域网/容器外访问；使用前请阅读安全章节
-glow serve ./docs --host 0.0.0.0 --port 8080
+# 允许局域网/容器外访问；等价于 --host 0.0.0.0
+glow serve ./docs --lan --port 8080
 ```
 
-`--host` 只接受 IP 地址。`--port 0` 表示由操作系统分配空闲端口，这是默认行为。
+`--host` 只接受 IP 地址，可用于只绑定某一张网卡。`--lan` 与 `--host` 互斥。`--port 0` 表示由操作系统分配空闲端口，这是默认行为。
 
 Linux 上的 `--open` 使用 `xdg-open`，macOS 使用 `open`。无桌面环境的服务器应省略 `--open`，复制终端打印的 URL。
+
+### 局域网访问
+
+先检查即将对外提供的文档，再用固定端口启动：
+
+```bash
+glow list ./docs
+glow serve ./docs --lan --port 8080
+```
+
+终端会区分本机地址、监听地址和其他设备要使用的地址：
+
+```text
+Local documentation: http://127.0.0.1:8080
+Network documentation: http://<this-device-LAN-IP>:8080
+Listening on: 0.0.0.0:8080
+warning: network access has no authentication or TLS; anyone who can reach this server can read the indexed documentation
+```
+
+`0.0.0.0` 是监听所有 IPv4 网卡的通配地址，不是应该在手机浏览器中输入的地址。查询运行 Glow 的机器的局域网 IP：
+
+```bash
+# macOS；Wi-Fi 通常是 en0
+ipconfig getifaddr en0
+
+# Linux；有多个结果时选择实际连接局域网的地址
+hostname -I
+```
+
+如果结果是 `192.168.1.42`，同一网络中的设备应访问 `http://192.168.1.42:8080/`。保持 Glow 进程运行，按 `Ctrl-C` 停止服务。
+
+多网卡、VPN、公共 Wi-Fi 或云服务器上，`--lan` 可能比预期暴露得更广。可改为只监听指定网卡：
+
+```bash
+glow serve ./docs --host 192.168.1.42 --port 8080
+```
+
+局域网模式不需要 Cloudflare 或互联网。它使用普通 HTTP 且没有账号、TLS 或 ACL；网络上任何能连接该 IP 和端口的设备都能读取索引中的 Markdown 和允许的图片/PDF。不要配置路由器端口转发，也不要在公网网卡或云安全组上开放这个端口。
+
+| 使用场景 | 命令 | 可达范围 |
+| --- | --- | --- |
+| 仅当前机器 | `glow serve ./docs` | loopback `127.0.0.1` |
+| 同一局域网 | `glow serve ./docs --lan --port 8080` | 能连接服务器该端口的设备 |
+| 临时公网分享 | `glow share ./docs` | 获得 Quick Tunnel URL 的任何人 |
 
 ### 阅读体验
 
@@ -413,7 +460,7 @@ Cloudflare 将 Quick Tunnel 定位为测试/开发功能：随机 URL 不稳定�
 
 ```text
 glow [OPTIONS] [SOURCE|DIR]
-glow serve [PATH] [--host IP] [--port PORT] [--open]
+glow serve [PATH] [--lan | --host IP] [--port PORT] [--open]
 glow share [PATH] [--cloudflared FILE] [--timeout SECONDS] [--open]
 glow list [PATH] [--json]
 glow config [path|init|edit|show]
@@ -444,6 +491,7 @@ glow completion <SHELL>
 | 参数 | 默认值 | 说明 |
 | --- | --- | --- |
 | `[PATH]` | `.` | 文档根目录 |
+| `--lan` | `false` | 监听全部 IPv4 网卡，允许其他设备访问 |
 | `--host <IP>` | `127.0.0.1` | 监听地址 |
 | `-P`, `--port <PORT>` | `0` | 监听端口；`0` 自动分配 |
 | `--open` | `false` | 打开默认浏览器 |
@@ -592,7 +640,7 @@ Web 服务被设计为只读文档浏览器，而不是通用静态文件服务�
 
 需要注意：
 
-- `glow serve --host 0.0.0.0` 会把没有鉴权的 HTTP 服务暴露到局域网或容器网络。
+- `glow serve --lan` 会把没有鉴权、没有 TLS 的 HTTP 服务绑定到全部 IPv4 网卡，包括 LAN、VPN、容器 bridge，云主机上还可能包括公网网卡。
 - `glow share` 会把整个选定文档根的允许内容暴露到匿名公网。
 - `--all` 会显著扩大两者的扫描和暴露范围。
 - HTTP(S) 远程文档属于不可信输入；Glow 会清洗内容，但仍应避免从未知来源下载敏感链接或附件。
@@ -610,6 +658,10 @@ Web 服务被设计为只读文档浏览器，而不是通用静态文件服务�
 | 终端没有颜色 | 检查输出是否被重定向，以及是否设置了 `NO_COLOR` |
 | `less` 不存在 | 设置可用的 `$PAGER`，或不要使用 `--pager` |
 | Linux `--open` 失败 | 安装/配置 `xdg-open`，或省略 `--open` 并复制打印的 URL |
+| 手机打开 `0.0.0.0:8080` 失败 | `0.0.0.0` 只是监听地址；改用运行 Glow 的机器的真实局域网 IP |
+| 本机能打开，其他设备超时 | 确认使用了 `--lan`，并检查系统防火墙、访客 Wi-Fi/AP isolation、VPN、VLAN 和客户端是否处于同一网络 |
+| `address already in use` | 更换固定端口，或使用 `--port 0` 让系统选择空闲端口 |
+| `cannot assign requested address` | `--host` 指定的 IP 不属于本机；重新查询网卡地址或改用 `--lan` |
 | `cloudflared was not found` | 安装 cloudflared、修复 `PATH`，或传 `--cloudflared` / `CLOUDFLARED_BIN` |
 | 等待 Quick Tunnel URL 超时 | 检查网络、防火墙、WARP 和 `~/.cloudflared/config.yaml`；增加 `--timeout` 只会延长 URL 等待时间 |
 | `cloudflared` 在 URL 前退出 | Glow 会显示退出状态和最近输出；需要完整日志时使用下面的手动调试方式 |
@@ -657,7 +709,7 @@ docker build -t glow-rust .
 # 本地 Web 文档站
 docker run --rm -p 8080:8080 \
   -v "$PWD:/docs:ro" \
-  glow-rust serve /docs --host 0.0.0.0 --port 8080
+  glow-rust serve /docs --lan --port 8080
 ```
 
 ### 代码结构

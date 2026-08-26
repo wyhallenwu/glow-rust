@@ -138,6 +138,50 @@ impl RunningServer {
         format!("http://{}", self.local_addr)
     }
 
+    /// URL that can be opened on the machine running the server.
+    ///
+    /// Wildcard listener addresses are valid bind targets, but are not
+    /// portable browser destinations. Map them back to the matching loopback
+    /// address while keeping the assigned port.
+    #[must_use]
+    pub fn browser_url(&self) -> String {
+        let browser_ip = match self.local_addr.ip() {
+            IpAddr::V4(ip) if ip.is_unspecified() => IpAddr::V4(Ipv4Addr::LOCALHOST),
+            IpAddr::V6(ip) if ip.is_unspecified() => IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+            ip => ip,
+        };
+        format!(
+            "http://{}",
+            SocketAddr::new(browser_ip, self.local_addr.port())
+        )
+    }
+
+    /// Whether the listener accepts connections beyond a loopback interface.
+    #[must_use]
+    pub fn is_network_exposed(&self) -> bool {
+        !self.local_addr.ip().is_loopback()
+    }
+
+    /// A client-facing URL or placeholder for another device on the network.
+    #[must_use]
+    pub fn network_url_hint(&self) -> Option<String> {
+        let ip = self.local_addr.ip();
+        if ip.is_loopback() {
+            return None;
+        }
+        if ip.is_unspecified() {
+            return Some(match ip {
+                IpAddr::V4(_) => {
+                    format!("http://<this-device-LAN-IP>:{}", self.local_addr.port())
+                }
+                IpAddr::V6(_) => {
+                    format!("http://[<this-device-IPv6>]:{}", self.local_addr.port())
+                }
+            });
+        }
+        Some(self.local_url())
+    }
+
     /// Ask the listener and polling loop to stop without waiting for them.
     pub fn request_shutdown(&self) {
         let _ = self.shutdown_tx.send(true);
@@ -334,7 +378,7 @@ pub async fn spawn(options: ServeOptions) -> Result<RunningServer> {
 /// Serve until Ctrl-C is received or the listener fails.
 pub async fn serve(options: ServeOptions) -> Result<()> {
     let mut server = spawn(options).await?;
-    println!("Local documentation: {}", server.local_url());
+    announce(&server);
     println!("Press Ctrl-C to stop.");
 
     let outcome = tokio::select! {
@@ -347,6 +391,18 @@ pub async fn serve(options: ServeOptions) -> Result<()> {
     };
     let shutdown = server.shutdown().await;
     outcome.and(shutdown)
+}
+
+/// Print client addresses and the security boundary of a running server.
+pub fn announce(server: &RunningServer) {
+    println!("Local documentation: {}", server.browser_url());
+    if let Some(network_url) = server.network_url_hint() {
+        println!("Network documentation: {network_url}");
+        println!("Listening on: {}", server.local_addr());
+        eprintln!(
+            "warning: network access has no authentication or TLS; anyone who can reach this server can read the indexed documentation"
+        );
+    }
 }
 
 /// Serve on loopback and expose the site through a Cloudflare Quick Tunnel.
@@ -1006,6 +1062,10 @@ mod tests {
         fs::write(root.path().join("secret.txt"), b"do not serve").expect("write secret");
 
         let server = spawn(ServeOptions::new(root.path())).await.expect("spawn");
+        assert!(server.local_addr().ip().is_loopback());
+        assert_eq!(server.local_url(), server.browser_url());
+        assert!(!server.is_network_exposed());
+        assert_eq!(server.network_url_hint(), None);
         let client = reqwest::Client::new();
         let document = client
             .get(format!("{}/doc/README.md", server.local_url()))
@@ -1042,6 +1102,35 @@ mod tests {
             .await
             .expect("secret request");
         assert_eq!(secret.status(), StatusCode::NOT_FOUND);
+
+        server.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test]
+    async fn all_interface_listener_has_a_reachable_local_browser_url() {
+        let root = tempdir().expect("tempdir");
+        fs::write(root.path().join("README.md"), "# LAN docs").expect("write markdown");
+
+        let server =
+            spawn(ServeOptions::new(root.path()).with_bind_ip(IpAddr::V4(Ipv4Addr::UNSPECIFIED)))
+                .await
+                .expect("spawn wildcard listener");
+
+        assert!(server.local_addr().ip().is_unspecified());
+        assert!(server.is_network_exposed());
+        assert!(server.browser_url().starts_with("http://127.0.0.1:"));
+        assert_eq!(
+            server.network_url_hint(),
+            Some(format!(
+                "http://<this-device-LAN-IP>:{}",
+                server.local_addr().port()
+            ))
+        );
+
+        let response = reqwest::get(format!("{}/api/status", server.browser_url()))
+            .await
+            .expect("request through loopback");
+        assert_eq!(response.status(), StatusCode::OK);
 
         server.shutdown().await.expect("shutdown");
     }

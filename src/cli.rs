@@ -1,4 +1,7 @@
-use std::{net::IpAddr, path::PathBuf};
+use std::{
+    net::{IpAddr, Ipv4Addr},
+    path::PathBuf,
+};
 
 use clap::{Args, Parser, Subcommand};
 use clap_complete::Shell;
@@ -80,9 +83,13 @@ pub struct ServeArgs {
     #[arg(default_value = ".")]
     pub path: PathBuf,
 
-    /// Address to bind. Keep the default for local-only access.
-    #[arg(long, default_value = "127.0.0.1")]
-    pub host: IpAddr,
+    /// Listen on all IPv4 interfaces so other devices can connect.
+    #[arg(long, conflicts_with = "host")]
+    pub lan: bool,
+
+    /// Address to bind. Defaults to 127.0.0.1 for local-only access.
+    #[arg(long, value_name = "IP")]
+    pub host: Option<IpAddr>,
 
     /// Port to bind; zero selects a free port.
     #[arg(short = 'P', long, default_value_t = 0)]
@@ -91,6 +98,19 @@ pub struct ServeArgs {
     /// Open the site in the default browser.
     #[arg(long)]
     pub open: bool,
+}
+
+impl ServeArgs {
+    /// Resolve the requested listener address while keeping network access
+    /// opt-in.
+    #[must_use]
+    pub fn bind_ip(&self) -> IpAddr {
+        if self.lan {
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED)
+        } else {
+            self.host.unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST))
+        }
+    }
 }
 
 #[derive(Clone, Debug, Args)]
@@ -141,4 +161,38 @@ pub enum ConfigAction {
     Edit,
     /// Print the resolved configuration.
     Show,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn serve_args(arguments: &[&str]) -> ServeArgs {
+        let cli = Cli::try_parse_from(arguments).expect("parse CLI");
+        match cli.command {
+            Some(Command::Serve(arguments)) => arguments,
+            _ => panic!("expected serve command"),
+        }
+    }
+
+    #[test]
+    fn serve_defaults_to_loopback() {
+        let arguments = serve_args(&["glow", "serve"]);
+        assert_eq!(arguments.bind_ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
+    }
+
+    #[test]
+    fn lan_mode_binds_all_ipv4_interfaces() {
+        let arguments = serve_args(&["glow", "serve", "--lan"]);
+        assert_eq!(arguments.bind_ip(), IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+    }
+
+    #[test]
+    fn serve_accepts_a_specific_interface() {
+        let arguments = serve_args(&["glow", "serve", "--host", "192.0.2.8"]);
+        assert_eq!(
+            arguments.bind_ip(),
+            "192.0.2.8".parse::<IpAddr>().expect("test IP")
+        );
+    }
 }

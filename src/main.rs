@@ -93,8 +93,9 @@ async fn run_command(
 ) -> Result<()> {
     match command {
         Command::Serve(arguments) => {
+            let bind_ip = arguments.bind_ip();
             let mut options = ServeOptions::new(arguments.path)
-                .with_bind_ip(arguments.host)
+                .with_bind_ip(bind_ip)
                 .with_port(arguments.port)
                 .with_hidden(config.include_hidden);
             options.respect_gitignore = !config.include_hidden;
@@ -129,8 +130,8 @@ async fn run_command(
 
 async fn serve_and_open(options: ServeOptions) -> Result<()> {
     let mut server = web::spawn(options).await?;
-    let url = server.local_url();
-    println!("Local documentation: {url}");
+    web::announce(&server);
+    let url = server.browser_url();
     open_browser(&url)?;
     println!("Press Ctrl-C to stop.");
     let reason = tokio::select! {
