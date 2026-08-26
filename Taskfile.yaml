@@ -1,0 +1,29 @@
+# https://taskfile.dev
+
+version: '3'
+
+tasks:
+  build:
+    desc: Build the Rust binary
+    cmds:
+      - cargo build --locked
+
+  fmt:
+    desc: Check Rust formatting
+    cmds:
+      - cargo fmt --all -- --check
+
+  lint:
+    desc: Run Clippy with warnings denied
+    cmds:
+      - cargo clippy --all-targets --all-features -- -D warnings
+
+  test:
+    desc: Run the Rust test suite
+    cmds:
+      - cargo test --all-targets --locked {{.CLI_ARGS}}
+
+  run:
+    desc: Run Glow against the current folder
+    cmds:
+      - cargo run -- .
