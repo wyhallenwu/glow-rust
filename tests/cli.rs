@@ -29,19 +29,36 @@ fn list_reports_nested_markdown_as_json() {
     std::fs::write(temp.path().join("guide/deep/api.md"), "# API").expect("write API doc");
     std::fs::write(temp.path().join("guide/deep/code.rs"), "fn main() {}").expect("write code");
 
-    glow()
+    let output = glow()
         .args([
             "list",
             temp.path().to_str().expect("UTF-8 temp path"),
             "--json",
         ])
-        .assert()
-        .success()
-        .stdout(
-            predicate::str::contains("README.md")
-                .and(predicate::str::contains("guide/deep/api.md"))
-                .and(predicate::str::contains("code.rs").not()),
-        );
+        .output()
+        .expect("run list command");
+    assert!(
+        output.status.success(),
+        "list failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let documents: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("parse list JSON");
+    let paths = documents
+        .as_array()
+        .expect("list JSON array")
+        .iter()
+        .map(|document| {
+            document["path"]
+                .as_str()
+                .expect("document path")
+                .replace('\\', "/")
+        })
+        .collect::<Vec<_>>();
+    assert!(paths.iter().any(|path| path == "README.md"));
+    assert!(paths.iter().any(|path| path == "guide/deep/api.md"));
+    assert!(!paths.iter().any(|path| path.ends_with("code.rs")));
 }
 
 #[test]
