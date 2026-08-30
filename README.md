@@ -41,8 +41,7 @@ Glow 是一个面向终端和浏览器的 Markdown 阅读器。它可以渲染�
 macOS（Apple Silicon/Intel）和 Linux（ARM64/x86_64）可以直接安装预编译的最新 Release，不需要 Rust 工具链：
 
 ```bash
-curl --proto '=https' --tlsv1.2 -fsSL \
-  https://raw.githubusercontent.com/wyhallenwu/glow-rust/main/install.sh | bash
+curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/wyhallenwu/glow-rust/main/install.sh | bash
 ```
 
 安装器会识别当前平台，下载对应的 GitHub Release 压缩包，使用 Release 中的 `checksums.txt` 校验 SHA-256，然后安装到 `~/.local/bin/glow`。安装过程不会调用 `sudo`。Linux 预编译产物面向 GNU/glibc；Alpine 等 musl 系统、较旧的 glibc 系统以及其他 CPU 架构请使用下面的源码构建脚本。
