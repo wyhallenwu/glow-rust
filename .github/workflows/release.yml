@@ -1,0 +1,116 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v[0-9]*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Check tag and package version
+        shell: bash
+        run: |
+          package_version="$(awk -F '"' '/^version = "/ { print $2; exit }' Cargo.toml)"
+          if [[ -z "${package_version}" ]]; then
+            echo "Cargo.toml does not contain a package version" >&2
+            exit 1
+          fi
+          if [[ "${GITHUB_REF_NAME}" != "v${package_version}" ]]; then
+            echo "tag ${GITHUB_REF_NAME} does not match Cargo.toml version ${package_version}" >&2
+            exit 1
+          fi
+      - name: Validate installer
+        run: |
+          bash -n install.sh scripts/build.sh scripts/test-install.sh
+          bash scripts/test-install.sh
+      - run: cargo test --all-targets --locked
+
+  build:
+    needs: validate
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - runner: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+          - runner: macos-15
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+      - name: Build release binary
+        run: cargo build --release --locked --target "${{ matrix.target }}"
+      - name: Package release archive
+        shell: bash
+        run: |
+          archive="glow-${{ matrix.target }}.tar.gz"
+          binary="target/${{ matrix.target }}/release/glow"
+          test -x "${binary}"
+          "${binary}" --version
+          mkdir -p dist/package
+          cp "${binary}" dist/package/glow
+          tar -czf "dist/${archive}" -C dist/package glow
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release-${{ matrix.target }}
+          path: dist/glow-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    needs: build
+    runs-on: ubuntu-22.04
+    permissions:
+      actions: read
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: release-*
+          path: release-assets
+          merge-multiple: true
+      - name: Generate checksums
+        shell: bash
+        run: |
+          asset_count="$(find release-assets -maxdepth 1 -name 'glow-*.tar.gz' | wc -l | tr -d '[:space:]')"
+          if [[ "${asset_count}" != "4" ]]; then
+            echo "expected 4 release archives, found ${asset_count}" >&2
+            exit 1
+          fi
+          (
+            cd release-assets
+            sha256sum glow-*.tar.gz > checksums.txt
+          )
+      - name: Publish GitHub Release
+        run: |
+          gh release create "${GITHUB_REF_NAME}" release-assets/* \
+            --repo "${GITHUB_REPOSITORY}" \
+            --verify-tag \
+            --generate-notes \
+            --latest \
+            --title "Glow ${GITHUB_REF_NAME#v}"

@@ -23,6 +23,8 @@ jobs:
         if: runner.os != 'Windows'
         shell: bash
         run: |
+          bash -n install.sh scripts/test-install.sh
+          bash scripts/test-install.sh
           bash -n scripts/build.sh
           bash scripts/build.sh --help >/dev/null
       - run: cargo test --all-targets --locked

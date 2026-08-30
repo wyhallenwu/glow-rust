@@ -7,6 +7,7 @@ Glow 是一个面向终端和浏览器的 Markdown 阅读器。它可以渲染�
 ## 目录
 
 - [主要功能](#主要功能)
+- [一行安装](#一行安装)
 - [平台与构建要求](#平台与构建要求)
 - [一键构建脚本](#一键构建脚本)
 - [快速开始](#快速开始)
@@ -34,6 +35,40 @@ Glow 是一个面向终端和浏览器的 Markdown 阅读器。它可以渲染�
 - 支持本地文件、标准输入、HTTP(S) URL，以及 GitHub/GitLab 仓库 README 快捷方式。
 - 使用 `glow share` 一条命令创建临时 Cloudflare Quick Tunnel。
 - Web 静态资源直接嵌入 Rust 二进制，发布时只需要一个 `glow` 文件。
+
+## 一行安装
+
+macOS（Apple Silicon/Intel）和 Linux（ARM64/x86_64）可以直接安装预编译的最新 Release，不需要 Rust 工具链：
+
+```bash
+curl --proto '=https' --tlsv1.2 -fsSL \
+  https://raw.githubusercontent.com/wyhallenwu/glow-rust/main/install.sh | bash
+```
+
+安装器会识别当前平台，下载对应的 GitHub Release 压缩包，使用 Release 中的 `checksums.txt` 校验 SHA-256，然后安装到 `~/.local/bin/glow`。安装过程不会调用 `sudo`。Linux 预编译产物面向 GNU/glibc；Alpine 等 musl 系统、较旧的 glibc 系统以及其他 CPU 架构请使用下面的源码构建脚本。
+
+可以固定版本或更改安装目录：
+
+```bash
+# 固定版本
+curl --proto '=https' --tlsv1.2 -fsSL \
+  https://raw.githubusercontent.com/wyhallenwu/glow-rust/main/install.sh \
+  | bash -s -- --version v4.0.0
+
+# 安装到其他目录
+curl --proto '=https' --tlsv1.2 -fsSL \
+  https://raw.githubusercontent.com/wyhallenwu/glow-rust/main/install.sh \
+  | bash -s -- --install-dir /usr/local/bin
+```
+
+目标目录必须可写；安装到 `/usr/local/bin` 是否需要额外权限取决于系统配置。希望先审查脚本时，可以下载后再执行：
+
+```bash
+curl --proto '=https' --tlsv1.2 -fsSLo install.sh \
+  https://raw.githubusercontent.com/wyhallenwu/glow-rust/main/install.sh
+less install.sh
+bash install.sh
+```
 
 ## 平台与构建要求
 
@@ -699,10 +734,27 @@ cargo run -- .
 构建脚本自身可以这样检查：
 
 ```bash
+bash -n install.sh scripts/test-install.sh
+bash scripts/test-install.sh
 bash -n scripts/build.sh
 bash scripts/build.sh --help
 bash scripts/build.sh --no-install
 ```
+
+### 发布 Release
+
+`.github/workflows/release.yml` 会在推送版本 tag 后，原生构建 Linux x86_64/ARM64 和 macOS Intel/Apple Silicon 四个二进制，生成 SHA-256 校验文件并发布 GitHub Release。tag 必须与 `Cargo.toml` 中的版本完全一致：
+
+```bash
+# 先更新 Cargo.toml 的 version，并让 Cargo.lock 同步
+cargo check
+cargo test --all-targets --locked
+
+git tag v4.0.0
+git push origin v4.0.0
+```
+
+Release 发布成功后，一行安装脚本会自动从 `releases/latest/download` 获取这四个平台对应的最新产物。发布工作流仅接受已经存在并被推送的 tag，不会自行创建或移动 tag。
 
 也可以使用 Docker 构建：
 
