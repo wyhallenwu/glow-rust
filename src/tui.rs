@@ -5,11 +5,12 @@ use std::{
     fs,
     io::{self, Stdout},
     path::{Path, PathBuf},
+    process::Command as ProcessCommand,
     sync::mpsc::{self, Receiver},
     time::{Duration, Instant, SystemTime},
 };
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use crossterm::{
     cursor,
     event::{
@@ -260,6 +261,82 @@ struct PreviewCache {
     lines: Vec<Line<'static>>,
 }
 
+#[derive(Clone, Debug)]
+struct GitRepository {
+    root: PathBuf,
+    branches: Vec<String>,
+    current_branch: Option<String>,
+    head_label: String,
+}
+
+impl GitRepository {
+    fn discover(path: &Path) -> Option<Self> {
+        let output = ProcessCommand::new("git")
+            .arg("-C")
+            .arg(path)
+            .args(["rev-parse", "--show-toplevel"])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+
+        let root = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
+        if root.as_os_str().is_empty() {
+            return None;
+        }
+        let root = root.canonicalize().unwrap_or(root);
+        let mut repository = Self {
+            root,
+            branches: Vec::new(),
+            current_branch: None,
+            head_label: String::new(),
+        };
+        repository.refresh().ok()?;
+        Some(repository)
+    }
+
+    fn refresh(&mut self) -> Result<()> {
+        let branches = run_git(
+            &self.root,
+            &[
+                "for-each-ref",
+                "--format=%(refname:short)",
+                "--sort=refname",
+                "refs/heads",
+            ],
+        )?;
+        self.branches = branches
+            .lines()
+            .map(str::trim)
+            .filter(|branch| !branch.is_empty())
+            .map(ToOwned::to_owned)
+            .collect();
+
+        self.current_branch =
+            git_stdout(&self.root, &["symbolic-ref", "--quiet", "--short", "HEAD"])
+                .filter(|branch| !branch.is_empty());
+        self.head_label = self.current_branch.clone().unwrap_or_else(|| {
+            git_stdout(&self.root, &["rev-parse", "--short", "HEAD"])
+                .filter(|head| !head.is_empty())
+                .map_or_else(|| "unborn".to_string(), |head| format!("detached@{head}"))
+        });
+        Ok(())
+    }
+
+    fn switch_to(&self, branch: &str) -> Result<()> {
+        // `--` ensures even a deliberately malformed ref cannot be parsed as
+        // a `git switch` option.
+        run_git(&self.root, &["switch", "--", branch]).map(|_| ())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct BranchPicker {
+    selected: usize,
+    offset: usize,
+}
+
 struct App {
     options: TuiOptions,
     scan_options: ScanOptions,
@@ -275,6 +352,8 @@ struct App {
     preview_viewport_height: usize,
     tree_offset: usize,
     preview_cache: Option<PreviewCache>,
+    git: Option<GitRepository>,
+    branch_picker: Option<BranchPicker>,
     status: String,
 }
 
@@ -289,6 +368,7 @@ impl App {
             .preferred_document()
             .map(|document| NodeKey::Document(document.relative_path.clone()));
         let count = index.documents.len();
+        let git = GitRepository::discover(&index.root);
         let mut app = Self {
             options,
             scan_options,
@@ -304,6 +384,8 @@ impl App {
             preview_viewport_height: 0,
             tree_offset: 0,
             preview_cache: None,
+            git,
+            branch_picker: None,
             status: format!("discovered {count} Markdown files"),
         };
         app.rebuild_rows(preferred.as_ref());
@@ -543,6 +625,109 @@ impl App {
         self.preview_viewport_height.saturating_sub(1).max(1) as isize
     }
 
+    fn open_branch_picker(&mut self) {
+        let Some(repository) = self.git.as_mut() else {
+            self.status = "branch switching is unavailable: not a Git repository".to_string();
+            return;
+        };
+        if let Err(error) = repository.refresh() {
+            self.status = format!("cannot refresh Git branches: {error:#}");
+            return;
+        }
+        if repository.branches.is_empty() {
+            self.status = "this repository has no local branches yet".to_string();
+            return;
+        }
+
+        let selected = repository
+            .current_branch
+            .as_ref()
+            .and_then(|current| {
+                repository
+                    .branches
+                    .iter()
+                    .position(|branch| branch == current)
+            })
+            .unwrap_or(0);
+        self.branch_picker = Some(BranchPicker {
+            selected,
+            offset: 0,
+        });
+    }
+
+    fn handle_branch_picker_key(&mut self, key: KeyEvent) {
+        let branch_count = self
+            .git
+            .as_ref()
+            .map_or(0, |repository| repository.branches.len());
+        let Some(picker) = self.branch_picker.as_mut() else {
+            return;
+        };
+
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('b' | 'q') => self.branch_picker = None,
+            KeyCode::Down | KeyCode::Char('j') => {
+                picker.selected = picker
+                    .selected
+                    .saturating_add(1)
+                    .min(branch_count.saturating_sub(1));
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                picker.selected = picker.selected.saturating_sub(1);
+            }
+            KeyCode::Home | KeyCode::Char('g') => picker.selected = 0,
+            KeyCode::End | KeyCode::Char('G') => {
+                picker.selected = branch_count.saturating_sub(1);
+            }
+            KeyCode::Enter => {
+                let selected = picker.selected;
+                let branch = self
+                    .git
+                    .as_ref()
+                    .and_then(|repository| repository.branches.get(selected))
+                    .cloned();
+                self.branch_picker = None;
+                if let Some(branch) = branch {
+                    self.switch_branch(&branch);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn switch_branch(&mut self, branch: &str) {
+        let Some(repository) = self.git.as_ref() else {
+            return;
+        };
+        if repository.current_branch.as_deref() == Some(branch) {
+            self.status = format!("already on branch {branch}");
+            return;
+        }
+        if let Err(error) = repository.switch_to(branch) {
+            self.status = format!("cannot switch to {branch}: {error:#}");
+            return;
+        }
+
+        if let Some(repository) = self.git.as_mut()
+            && let Err(error) = repository.refresh()
+        {
+            self.status = format!("switched to {branch}, but cannot refresh Git state: {error:#}");
+            return;
+        }
+        self.preview_cache = None;
+        match self.rescan() {
+            Ok(()) => {
+                self.status = format!(
+                    "switched to {branch}: {} Markdown files",
+                    self.index.documents.len()
+                );
+            }
+            Err(error) => {
+                self.status = format!("switched to {branch}, but rescan failed: {error:#}");
+            }
+        }
+    }
+
     fn ensure_preview(&mut self, width: usize) {
         let Some(document) = self.selected_document().cloned() else {
             self.preview_cache = None;
@@ -621,6 +806,11 @@ impl App {
             return Ok(LoopControl::Quit);
         }
 
+        if self.branch_picker.is_some() {
+            self.handle_branch_picker_key(key);
+            return Ok(LoopControl::Continue);
+        }
+
         if self.filter_editing {
             match key.code {
                 KeyCode::Esc | KeyCode::Enter => self.filter_editing = false,
@@ -659,6 +849,7 @@ impl App {
                 self.status = "filter cleared".to_string();
             }
             KeyCode::Char('?') => self.help = true,
+            KeyCode::Char('b') => self.open_branch_picker(),
             KeyCode::Char('/') => self.filter_editing = true,
             KeyCode::Tab | KeyCode::BackTab => self.focus = self.focus.toggled(),
             KeyCode::Enter => {
@@ -701,6 +892,9 @@ impl App {
     }
 
     fn handle_mouse(&mut self, mouse: MouseEvent, regions: UiRegions) {
+        if self.branch_picker.is_some() {
+            return;
+        }
         let in_tree = regions
             .tree
             .is_some_and(|rect| rect_contains(rect, mouse.column, mouse.row));
@@ -797,6 +991,9 @@ fn draw(frame: &mut Frame<'_>, app: &mut App) -> UiRegions {
     if app.help {
         draw_help(frame, area);
     }
+    if app.branch_picker.is_some() {
+        draw_branch_picker(frame, app, area);
+    }
     regions
 }
 
@@ -807,7 +1004,7 @@ fn draw_header(frame: &mut Frame<'_>, app: &App, area: Rect) {
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("/");
-    let header = Paragraph::new(Line::from(vec![
+    let mut spans = vec![
         Span::styled(
             " glow ",
             Style::default()
@@ -821,7 +1018,20 @@ fn draw_header(frame: &mut Frame<'_>, app: &App, area: Rect) {
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         ),
-    ]));
+    ];
+    if let Some(repository) = &app.git {
+        spans.push(Span::styled(
+            "  •  git: ",
+            Style::default().fg(Color::DarkGray),
+        ));
+        spans.push(Span::styled(
+            repository.head_label.clone(),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    let header = Paragraph::new(Line::from(spans));
     frame.render_widget(header, area);
 }
 
@@ -989,9 +1199,14 @@ fn draw_footer(frame: &mut Frame<'_>, app: &App, area: Rect) {
         } else {
             format!("  •  filter: /{}", app.filter)
         };
+        let git_hint = if app.git.is_some() {
+            "  b branches"
+        } else {
+            ""
+        };
         Line::from(Span::styled(
             format!(
-                " ↑↓/jk move or scroll  Enter open/toggle  Tab pane  / filter  PgUp/PgDn  r refresh  ? help  q quit{filter}"
+                " ↑↓/jk move or scroll  Enter open/toggle  Tab pane  / filter{git_hint}  r refresh  ? help  q quit{filter}"
             ),
             Style::default().fg(Color::DarkGray),
         ))
@@ -1023,6 +1238,7 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect) {
                 .add_modifier(Modifier::BOLD),
         )),
         Line::from("  /                filter paths and titles"),
+        Line::from("  b                choose a local Git branch (in a repository)"),
         Line::from("  r                rescan now (changes are auto-watched)"),
         Line::from("  q / Esc          quit"),
         Line::from("  ?                close this help"),
@@ -1034,6 +1250,99 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect) {
             .title(" Help "),
     );
     frame.render_widget(paragraph, popup);
+}
+
+fn draw_branch_picker(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
+    let Some(repository) = app.git.as_ref() else {
+        return;
+    };
+    let height = u16::try_from(repository.branches.len().saturating_add(4))
+        .unwrap_or(u16::MAX)
+        .min(area.height.saturating_sub(2))
+        .max(5);
+    let popup = centered_rect(58, height, area);
+    frame.render_widget(Clear, popup);
+
+    let items: Vec<ListItem<'_>> = repository
+        .branches
+        .iter()
+        .map(|branch| {
+            let current = repository.current_branch.as_deref() == Some(branch.as_str());
+            let marker = if current { "● " } else { "  " };
+            let style = if current {
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::White)
+            };
+            ListItem::new(Line::from(vec![
+                Span::styled(marker, style),
+                Span::styled(branch.clone(), style),
+            ]))
+        })
+        .collect();
+
+    let Some(picker) = app.branch_picker.as_mut() else {
+        return;
+    };
+    let mut state = ListState::default();
+    state.select(Some(picker.selected));
+    *state.offset_mut() = picker.offset;
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan))
+                .title(" Git branches ")
+                .title_bottom(" ↑↓/jk select  Enter switch  Esc cancel "),
+        )
+        .highlight_symbol("│ ")
+        .highlight_style(
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        );
+    frame.render_stateful_widget(list, popup, &mut state);
+    picker.offset = state.offset();
+}
+
+fn run_git(root: &Path, arguments: &[&str]) -> Result<String> {
+    let output = ProcessCommand::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(arguments)
+        .output()
+        .with_context(|| format!("cannot run git in {}", root.display()))?;
+    if !output.status.success() {
+        let detail = concise_command_output(&output.stderr);
+        if detail.is_empty() {
+            bail!("git exited with {}", output.status);
+        }
+        bail!("{detail}");
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn git_stdout(root: &Path, arguments: &[&str]) -> Option<String> {
+    let output = ProcessCommand::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(arguments)
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn concise_command_output(output: &[u8]) -> String {
+    String::from_utf8_lossy(output)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn add_line_numbers(lines: Vec<Line<'static>>) -> Vec<Line<'static>> {
@@ -1107,7 +1416,7 @@ fn centered_rect(percent_x: u16, height: u16, area: Rect) -> Rect {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::{fs, process::Command};
 
     use crossterm::event::{KeyEvent, KeyModifiers};
     use tempfile::tempdir;
@@ -1122,6 +1431,52 @@ mod tests {
         fs::write(temp.path().join("guide/deep/api.md"), "# API Reference").expect("write api");
         let app = App::new(temp.path(), TuiOptions::default()).expect("app");
         (temp, app)
+    }
+
+    fn git_fixture() -> Option<(tempfile::TempDir, App, String)> {
+        if !Command::new("git")
+            .arg("--version")
+            .output()
+            .ok()?
+            .status
+            .success()
+        {
+            return None;
+        }
+
+        let temp = tempdir().expect("tempdir");
+        let run = |arguments: &[&str]| {
+            let output = Command::new("git")
+                .arg("-C")
+                .arg(temp.path())
+                .args(arguments)
+                .output()
+                .expect("run git fixture command");
+            assert!(
+                output.status.success(),
+                "git {} failed: {}",
+                arguments.join(" "),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        };
+
+        run(&["init", "--quiet"]);
+        run(&["config", "user.name", "Glow Tests"]);
+        run(&["config", "user.email", "glow@example.invalid"]);
+        fs::write(temp.path().join("README.md"), "# Main branch").expect("write main README");
+        run(&["add", "README.md"]);
+        run(&["commit", "--quiet", "-m", "main"]);
+        let initial_branch = run(&["branch", "--show-current"]);
+
+        run(&["switch", "--quiet", "-c", "docs-alt"]);
+        fs::write(temp.path().join("README.md"), "# Alternate branch")
+            .expect("write alternate README");
+        run(&["commit", "--quiet", "-am", "alternate"]);
+        run(&["switch", "--quiet", &initial_branch]);
+
+        let app = App::new(temp.path(), TuiOptions::default()).expect("git app");
+        Some((temp, app, initial_branch))
     }
 
     #[test]
@@ -1196,5 +1551,75 @@ mod tests {
             .expect("key");
         assert_eq!(result, LoopControl::Continue);
         assert_eq!(app.filter, "q");
+    }
+
+    #[test]
+    fn branch_picker_switches_branch_and_rescans_documents() {
+        let Some((_temp, mut app, initial_branch)) = git_fixture() else {
+            return;
+        };
+        let repository = app.git.as_ref().expect("Git repository detected");
+        assert_eq!(
+            repository.current_branch.as_deref(),
+            Some(initial_branch.as_str())
+        );
+        assert!(
+            repository
+                .branches
+                .iter()
+                .any(|branch| branch == "docs-alt")
+        );
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE))
+            .expect("open branch picker");
+        let alternate = app
+            .git
+            .as_ref()
+            .expect("repository")
+            .branches
+            .iter()
+            .position(|branch| branch == "docs-alt")
+            .expect("alternate branch");
+        app.branch_picker.as_mut().expect("branch picker").selected = alternate;
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("switch branch");
+
+        assert!(app.branch_picker.is_none());
+        assert_eq!(
+            app.git
+                .as_ref()
+                .and_then(|git| git.current_branch.as_deref()),
+            Some("docs-alt")
+        );
+        assert_eq!(
+            app.index
+                .preferred_document()
+                .map(|document| document.title.as_str()),
+            Some("Alternate branch")
+        );
+        assert!(app.status.starts_with("switched to docs-alt:"));
+    }
+
+    #[test]
+    fn branch_switch_keeps_worktree_changes_when_git_rejects_it() {
+        let Some((temp, mut app, initial_branch)) = git_fixture() else {
+            return;
+        };
+        fs::write(temp.path().join("README.md"), "# Unsaved local work")
+            .expect("write local change");
+
+        app.switch_branch("docs-alt");
+
+        assert_eq!(
+            app.git
+                .as_ref()
+                .and_then(|git| git.current_branch.as_deref()),
+            Some(initial_branch.as_str())
+        );
+        assert_eq!(
+            fs::read_to_string(temp.path().join("README.md")).expect("read local change"),
+            "# Unsaved local work"
+        );
+        assert!(app.status.starts_with("cannot switch to docs-alt:"));
     }
 }
